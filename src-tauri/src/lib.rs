@@ -208,7 +208,11 @@ pub fn find_openrgb_executable(app: &tauri::AppHandle) -> Result<PathBuf, String
     // 1. App resource directory (bundled in installer/package)
     if let Ok(res_dir) = app.path().resource_dir() {
         search_dirs.push(res_dir.clone());
+        search_dirs.push(res_dir.join("_up_"));
+        search_dirs.push(res_dir.join("_up_").join("bin"));
+        search_dirs.push(res_dir.join("_up_").join("bin").join("OpenRGB"));
         search_dirs.push(res_dir.join("bin"));
+        search_dirs.push(res_dir.join("bin").join("OpenRGB"));
         search_dirs.push(res_dir.join("resources"));
     }
 
@@ -218,7 +222,11 @@ pub fn find_openrgb_executable(app: &tauri::AppHandle) -> Result<PathBuf, String
             let mut curr = exe_dir.to_path_buf();
             for _ in 0..6 {
                 search_dirs.push(curr.clone());
+                search_dirs.push(curr.join("_up_"));
+                search_dirs.push(curr.join("_up_").join("bin"));
+                search_dirs.push(curr.join("_up_").join("bin").join("OpenRGB"));
                 search_dirs.push(curr.join("bin"));
+                search_dirs.push(curr.join("bin").join("OpenRGB"));
                 if !curr.pop() {
                     break;
                 }
@@ -229,15 +237,22 @@ pub fn find_openrgb_executable(app: &tauri::AppHandle) -> Result<PathBuf, String
     // 3. Current working directory and parent
     if let Ok(cwd) = std::env::current_dir() {
         search_dirs.push(cwd.clone());
+        search_dirs.push(cwd.join("_up_").join("bin"));
         search_dirs.push(cwd.join("bin"));
+        search_dirs.push(cwd.join("bin").join("OpenRGB"));
         if let Some(parent) = cwd.parent() {
             search_dirs.push(parent.to_path_buf());
             search_dirs.push(parent.join("bin"));
+            search_dirs.push(parent.join("bin").join("OpenRGB"));
         }
     }
 
     // Candidate relative subpaths where OpenRGB may reside
     let relative_candidates = [
+        r"_up_\bin\OpenRGB\OpenRGB.exe",
+        r"_up_\bin\OpenRGB.exe",
+        r"bin\OpenRGB\OpenRGB.exe",
+        r"bin\OpenRGB.exe",
         r"OpenRGB\OpenRGB.exe",
         r"OpenRGB\OpenRGB Windows 64-bit\OpenRGB.exe",
         r"OpenRGB Windows 64-bit\OpenRGB.exe",
@@ -251,6 +266,33 @@ pub fn find_openrgb_executable(app: &tauri::AppHandle) -> Result<PathBuf, String
             if candidate.is_file() {
                 log::info!("Discovered OpenRGB at: {}", candidate.display());
                 return Ok(candidate);
+            }
+        }
+    }
+
+    // 4. Direct scan in res_dir and exe_dir for bundled OpenRGB
+    let root_dirs = [
+        app.path().resource_dir().ok(),
+        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())),
+    ];
+    for root in root_dirs.into_iter().flatten() {
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let c1 = p.join("OpenRGB.exe");
+                    if c1.is_file() {
+                        return Ok(c1);
+                    }
+                    let c2 = p.join("bin").join("OpenRGB.exe");
+                    if c2.is_file() {
+                        return Ok(c2);
+                    }
+                    let c3 = p.join("bin").join("OpenRGB").join("OpenRGB.exe");
+                    if c3.is_file() {
+                        return Ok(c3);
+                    }
+                }
             }
         }
     }

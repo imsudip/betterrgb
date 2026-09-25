@@ -20,7 +20,7 @@ pub const RGBCONTROLLER_SETCUSTOMMODE: u32 = 1100;
 #[allow(dead_code)]
 pub const RGBCONTROLLER_UPDATEMODE: u32 = 1101;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RgbColor {
     pub r: u8,
     pub g: u8,

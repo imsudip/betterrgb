@@ -101,7 +101,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
       data-tauri-drag-region
       onMouseDown={handleMouseDown}
       onDoubleClick={handleMaximize}
-      className="h-12 w-full select-none flex items-center justify-between px-3 border-b border-white/[0.08] bg-[#07090e]/90 backdrop-blur-2xl z-50 shrink-0 cursor-default"
+      className="h-12 w-full select-none flex items-center justify-between px-3 border-b border-white/[0.08] bg-[#07090e] z-50 shrink-0 cursor-default"
     >
       {/* Left: Branding & Status Badge */}
       <div className="flex items-center gap-2.5 pointer-events-none">
@@ -135,7 +135,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
           className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium border ml-1 ${
             connected
               ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
-              : "bg-amber-500/10 border-amber-500/30 text-amber-300 animate-pulse"
+              : "bg-amber-500/10 border-amber-500/30 text-amber-300"
           }`}
         >
           <div

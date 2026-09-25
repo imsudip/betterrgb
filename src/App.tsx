@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { motion, AnimatePresence } from "framer-motion";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Activity,
   Code,
@@ -29,10 +30,11 @@ import {
   ShieldCheck,
   Monitor,
   AppWindow,
+  Type,
+  Blocks,
 } from "lucide-react";
 import { TitleBar } from "./components/TitleBar";
 import { SpotlightCard } from "./components/SpotlightCard";
-import { TelemetrySparkline } from "./components/TelemetrySparkline";
 import { RotaryKnob } from "./components/RotaryKnob";
 
 interface RgbColor {
@@ -41,12 +43,22 @@ interface RgbColor {
   b: number;
 }
 
+interface ZoneInfo {
+  id: number;
+  name: string;
+  zone_type: number;
+  leds_min: number;
+  leds_max: number;
+  leds_count: number;
+}
+
 interface DeviceInfo {
   id: number;
   name: string;
   vendor: string;
   description: string;
   led_count: number;
+  zones?: ZoneInfo[];
 }
 
 interface AppStatePayload {
@@ -56,7 +68,7 @@ interface AppStatePayload {
   static_color: RgbColor;
   current_color: RgbColor;
   cpu_usage: number;
-  cpu_temp: number;
+  cpu_temp: number | null;
   active_app: string;
   is_coding_detected: boolean;
   is_gaming_detected: boolean;
@@ -65,6 +77,21 @@ interface AppStatePayload {
   audio_bands: number[];
   audio_sensitivity?: number;
   app_color?: RgbColor;
+  debug?: string;
+  debug_index?: number;
+  debug_paused?: boolean;
+  layout?: PanelLayout;
+  viz_style?: string;
+  marquee_text?: string;
+  game_speed?: number;
+}
+
+interface PanelLayout {
+  lanes: number;
+  leds_per_lane: number;
+  first_index: number;
+  serpentine: boolean;
+  bass_at_top: boolean;
 }
 
 interface Profile {
@@ -123,6 +150,511 @@ const BUILT_IN_PROFILES: Profile[] = [
   },
 ];
 
+// Module-level so it isn't rebuilt on every render.
+const MODES_LIST = [
+  {
+    id: "smart",
+    name: "Smart Autonomous",
+    description:
+      "Auto-detects active coding vs gaming and dynamically adjusts color tone & glare.",
+    icon: Sparkles,
+    color: "rgba(0, 210, 255, 0.16)",
+    glow: "#00d2ff",
+  },
+  {
+    id: "appsync",
+    name: "Adaptive App Glow",
+    description:
+      "Extracts brand colors directly from the foreground app's logo/icon and illuminates your PC.",
+    icon: AppWindow,
+    color: "rgba(0, 210, 255, 0.16)",
+    glow: "#00d2ff",
+  },
+  {
+    id: "coding",
+    name: "Arctic Code Focus",
+    description:
+      "Deep, glare-free arctic focus tone dimmed to 35% to protect night vision.",
+    icon: Code,
+    color: "rgba(56, 189, 248, 0.16)",
+    glow: "#38bdf8",
+  },
+  {
+    id: "thermal",
+    name: "Thermal Sentinel",
+    description:
+      "Direct real-time hardware temperature heat-mapping from Cool Green to Blazing Red.",
+    icon: Flame,
+    color: "rgba(249, 115, 22, 0.16)",
+    glow: "#f97316",
+  },
+  {
+    id: "visualizer",
+    name: "WASAPI Visualizer",
+    description:
+      "Ripples live system audio beats & frequency bands across all connected fans.",
+    icon: Volume2,
+    color: "rgba(168, 85, 247, 0.16)",
+    glow: "#a855f7",
+  },
+  {
+    id: "rainbow",
+    name: "Spectrum Wave",
+    description:
+      "Continuous ultra-smooth 360-degree rainbow stream across all ARGB headers.",
+    icon: Radio,
+    color: "rgba(16, 185, 129, 0.16)",
+    glow: "#10b981",
+  },
+  {
+    id: "breathing",
+    name: "Circadian Pulse",
+    description:
+      "Gentle rhythmic fading breath cycle on your chosen custom accent color.",
+    icon: Waves,
+    color: "rgba(234, 179, 8, 0.16)",
+    glow: "#eab308",
+  },
+  {
+    id: "static",
+    name: "Static Custom Accent",
+    description:
+      "Locks solid custom neon hue across all motherboard zones and fan hubs.",
+    icon: Palette,
+    color: "rgba(255, 255, 255, 0.12)",
+    glow: "#ffffff",
+  },
+  {
+    id: "text",
+    name: "Scrolling Message",
+    description:
+      "Marquee text scrolls up the panel in your accent colour. Set the message below.",
+    icon: Type,
+    color: "rgba(244, 114, 182, 0.16)",
+    glow: "#f472b6",
+  },
+  {
+    id: "snake",
+    name: "Snake (Auto-Play)",
+    description:
+      "A self-playing snake game runs up the panel, hunting food and avoiding itself.",
+    icon: Gamepad2,
+    color: "rgba(34, 197, 94, 0.16)",
+    glow: "#22c55e",
+  },
+  {
+    id: "tetris",
+    name: "Tetris (Auto-Play)",
+    description:
+      "A self-playing Tetris demo stacks tetrominoes and clears completed lines.",
+    icon: Blocks,
+    color: "rgba(56, 189, 248, 0.16)",
+    glow: "#38bdf8",
+  },
+];
+
+// Must match NUM_BANDS in src-tauri/src/audio.rs.
+const NUM_BANDS = 24;
+
+const BAND_HUES = Array.from({ length: NUM_BANDS }, (_, i) => {
+  const t = i / (NUM_BANDS - 1);
+  return `hsl(${(330 - t * 275 + 360) % 360}, 95%, 58%)`;
+});
+
+/**
+ * Minimal bitmap font mirroring src-tauri/src/font.rs, used only to render the
+ * on-screen preview.
+ *
+ * Text is drawn UPRIGHT: each glyph is 3 pixels wide (one per lane) and N tall.
+ * Rows are stored top-down, with bit 2 as the leftmost pixel - matching the Rust
+ * source. `glyphRowsBottomUp` converts to panel order and lane order.
+ */
+const PREVIEW_FONT: Record<string, { rows: number[]; h: number }> = {
+  A: { rows: [0b010, 0b101, 0b111, 0b101, 0b101], h: 5 },
+  B: { rows: [0b110, 0b101, 0b110, 0b101, 0b110], h: 5 },
+  C: { rows: [0b011, 0b100, 0b100, 0b100, 0b011], h: 5 },
+  D: { rows: [0b110, 0b101, 0b101, 0b101, 0b110], h: 5 },
+  E: { rows: [0b111, 0b100, 0b110, 0b100, 0b111], h: 5 },
+  F: { rows: [0b111, 0b100, 0b110, 0b100, 0b100], h: 5 },
+  G: { rows: [0b011, 0b100, 0b101, 0b101, 0b011], h: 5 },
+  H: { rows: [0b101, 0b101, 0b111, 0b101, 0b101], h: 5 },
+  I: { rows: [0b111, 0b010, 0b010, 0b010, 0b111], h: 5 },
+  J: { rows: [0b001, 0b001, 0b001, 0b101, 0b111], h: 5 },
+  K: { rows: [0b101, 0b101, 0b110, 0b101, 0b101], h: 5 },
+  L: { rows: [0b100, 0b100, 0b100, 0b100, 0b111], h: 5 },
+  M: { rows: [0b101, 0b111, 0b101, 0b101, 0b101], h: 5 },
+  N: { rows: [0b101, 0b111, 0b111, 0b101, 0b101], h: 5 },
+  O: { rows: [0b111, 0b101, 0b101, 0b101, 0b111], h: 5 },
+  P: { rows: [0b110, 0b101, 0b110, 0b100, 0b100], h: 5 },
+  Q: { rows: [0b111, 0b101, 0b101, 0b111, 0b001], h: 5 },
+  R: { rows: [0b110, 0b101, 0b110, 0b101, 0b101], h: 5 },
+  S: { rows: [0b011, 0b100, 0b010, 0b001, 0b110], h: 5 },
+  T: { rows: [0b111, 0b010, 0b010, 0b010, 0b010], h: 5 },
+  U: { rows: [0b101, 0b101, 0b101, 0b101, 0b111], h: 5 },
+  V: { rows: [0b101, 0b101, 0b101, 0b101, 0b010], h: 5 },
+  W: { rows: [0b101, 0b101, 0b111, 0b111, 0b101], h: 5 },
+  X: { rows: [0b101, 0b101, 0b010, 0b101, 0b101], h: 5 },
+  Y: { rows: [0b101, 0b101, 0b010, 0b010, 0b010], h: 5 },
+  Z: { rows: [0b111, 0b001, 0b010, 0b100, 0b111], h: 5 },
+  "0": { rows: [0b111, 0b101, 0b101, 0b101, 0b101, 0b101, 0b111], h: 7 },
+  "1": { rows: [0b010, 0b110, 0b010, 0b010, 0b010, 0b010, 0b111], h: 7 },
+  "2": { rows: [0b111, 0b001, 0b001, 0b111, 0b100, 0b100, 0b111], h: 7 },
+  "3": { rows: [0b111, 0b001, 0b001, 0b111, 0b001, 0b001, 0b111], h: 7 },
+  "4": { rows: [0b101, 0b101, 0b101, 0b111, 0b001, 0b001, 0b001], h: 7 },
+  "5": { rows: [0b111, 0b100, 0b100, 0b111, 0b001, 0b001, 0b111], h: 7 },
+  "6": { rows: [0b111, 0b100, 0b100, 0b111, 0b101, 0b101, 0b111], h: 7 },
+  "7": { rows: [0b111, 0b001, 0b001, 0b010, 0b010, 0b010, 0b010], h: 7 },
+  "8": { rows: [0b111, 0b101, 0b101, 0b111, 0b101, 0b101, 0b111], h: 7 },
+  "9": { rows: [0b111, 0b101, 0b101, 0b111, 0b001, 0b001, 0b111], h: 7 },
+  " ": { rows: [0, 0, 0], h: 3 },
+  "-": { rows: [0b000, 0b111, 0b000], h: 3 },
+  _: { rows: [0b000, 0b000, 0b111], h: 3 },
+  ".": { rows: [0b000, 0b000, 0b010], h: 3 },
+  ",": { rows: [0b000, 0b010, 0b100], h: 3 },
+  "!": { rows: [0b010, 0b010, 0b010, 0b000, 0b010], h: 5 },
+  "?": { rows: [0b111, 0b001, 0b011, 0b000, 0b010], h: 5 },
+  ":": { rows: [0b000, 0b010, 0b000], h: 3 },
+  "+": { rows: [0b000, 0b010, 0b111, 0b010, 0b000], h: 5 },
+  "=": { rows: [0b000, 0b111, 0b000, 0b111, 0b000], h: 5 },
+  "/": { rows: [0b001, 0b001, 0b010, 0b100, 0b100], h: 5 },
+  "(": { rows: [0b001, 0b010, 0b100, 0b010, 0b001], h: 5 },
+  ")": { rows: [0b100, 0b010, 0b001, 0b010, 0b100], h: 5 },
+  "'": { rows: [0b010, 0b010, 0b000], h: 3 },
+};
+
+const PREVIEW_GAP = 1;
+
+/** Reverse the three pixel bits, matching `mirror3` in the Rust font. */
+function mirror3(row: number): number {
+  return ((row & 0b001) << 2) | (row & 0b010) | ((row & 0b100) >> 2);
+}
+
+/**
+ * Flatten text into panel rows, bottom-up and in lane order.
+ * Mirrors `marquee_frame` in engine.rs.
+ */
+function renderMarqueeRows(text: string): number[] {
+  const out: number[] = [];
+  for (const ch of text.toUpperCase()) {
+    const g = PREVIEW_FONT[ch] ?? { rows: [0, 0, 0], h: 3 };
+    // Stored top-down; reverse for panel order, mirror for lane order.
+    const bottomUp = g.rows.slice(0, g.h).reverse().map(mirror3);
+    out.push(...bottomUp);
+    for (let i = 0; i < PREVIEW_GAP; i++) out.push(0);
+  }
+  return out;
+}
+
+/**
+ * Build the panel preview grid: `[lane][row]` -> lit or dark.
+ *
+ * Mirrors `marquee_frame` in engine.rs exactly, including the trailing blank gap
+ * and the scroll offset, so the preview animates like the real hardware.
+ */
+function buildMarqueePreview(
+  text: string,
+  lanes: number,
+  rows: number,
+  scroll: number,
+): boolean[][] {
+  const grid: boolean[][] = Array.from({ length: lanes }, () =>
+    new Array(rows).fill(false),
+  );
+
+  const template = renderMarqueeRows(text);
+  // Blank gap as tall as the panel, so the message clears before repeating.
+  for (let i = 0; i < rows; i++) template.push(0);
+  if (template.length === 0) return grid;
+
+  // The engine floors the offset, so the display only changes on whole rows.
+  const period = template.length;
+  const offset = ((Math.floor(scroll) % period) + period) % period;
+
+  for (let row = 0; row < rows; row++) {
+    const glyphRow = template[(row + offset) % period];
+    for (let lane = 0; lane < lanes && lane < 3; lane++) {
+      if ((glyphRow >> lane) & 1) grid[lane][row] = true;
+    }
+  }
+  return grid;
+}
+
+/**
+ * Animated panel preview for the scrolling-message mode.
+ *
+ * Advances the scroll at the same px/s rate sent to the backend and floors it to
+ * whole rows exactly as `marquee_frame` does, so what you see matches the fan.
+ */
+const MarqueePreview: React.FC<{
+  text: string;
+  speed: number;
+  lanes: number;
+  rows: number;
+}> = ({ text, speed, lanes, rows }) => {
+  const [scroll, setScroll] = useState(0);
+
+  useEffect(() => {
+    let raf = 0;
+    const start = performance.now();
+
+    const tick = (now: number) => {
+      // Floor to whole rows before storing. The engine only advances on row
+      // boundaries, so setting a fractional value would re-render 60x/sec for a
+      // display that changes a few times a second. Storing the floored value lets
+      // React skip the unchanged updates.
+      const rows_scrolled = Math.floor(((now - start) / 1000) * speed);
+      setScroll((prev) => (prev === rows_scrolled ? prev : rows_scrolled));
+      raf = requestAnimationFrame(tick);
+    };
+
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+    // Restart from the beginning when the message or speed changes, so the new
+    // text is shown from its first row rather than mid-message.
+  }, [speed, text]);
+
+  const grid = buildMarqueePreview(text, lanes, rows, scroll);
+
+  return (
+    <div className="flex items-end gap-3">
+      <div className="flex gap-1.5 p-2 rounded-lg bg-slate-950/80 border border-white/[0.06] w-fit">
+        {grid.map((lane, laneIdx) => (
+          <div key={laneIdx} className="flex flex-col-reverse gap-[2px]">
+            {lane.map((isLit, rowIdx) => (
+              <span
+                key={rowIdx}
+                className="h-1.5 w-1.5 rounded-full"
+                style={{
+                  backgroundColor: isLit ? "#f472b6" : "#1e293b",
+                }}
+              />
+            ))}
+          </div>
+        ))}
+      </div>
+      <div className="flex flex-col gap-0.5 text-[10px] font-mono text-slate-500">
+        <span>{speed} px/s</span>
+        <span>row {scroll}</span>
+      </div>
+    </div>
+  );
+};
+
+/**
+ * Mirror of `game_color` in games.rs, so the preview shows the same colours as
+ * the panel. The accent is whatever the user has selected for the snake body.
+ */
+function gameColor(idx: number, accent: RgbColor): string {
+  const mixWhite = (c: RgbColor, amount: number): RgbColor => {
+    const f = (v: number) => Math.round(v + (255 - v) * amount);
+    return { r: f(c.r), g: f(c.g), b: f(c.b) };
+  };
+  const rgb = (c: RgbColor) => `rgb(${c.r},${c.g},${c.b})`;
+
+  switch (idx) {
+    case 1: // PAL_HEAD
+      return rgb(mixWhite(accent, 0.75));
+    case 2: // PAL_FOOD
+      return "rgb(255,60,60)";
+    case 3: // I
+      return "rgb(0,220,255)";
+    case 4: // O
+      return "rgb(255,220,0)";
+    case 5: // T
+      return "rgb(170,0,255)";
+    case 6: // S
+      return "rgb(0,220,80)";
+    case 7: // Z
+      return "rgb(255,40,60)";
+    case 8: // J
+      return "rgb(60,90,255)";
+    case 9: // L
+      return "rgb(255,140,0)";
+    case 10: // PAL_CLEAR_A
+      return "rgb(255,255,255)";
+    case 11: // PAL_CLEAR_B
+      return "rgb(255,60,60)";
+    default: // PAL_BODY
+      return rgb(accent);
+  }
+}
+
+interface GameSnapshot {
+  /** Which game produced this frame: "snake" or "tetris". */
+  game: string;
+  lanes: (number | null)[][];
+  cleared: number;
+  flashing: boolean;
+  clearing_rows: number[];
+}
+
+/**
+ * Live preview of the Snake / Tetris board.
+ *
+ * This renders the *actual* engine state, streamed over the `game-frame` event at
+ * tick rate. It deliberately does not simulate the games in the browser: a second
+ * implementation would drift from the Rust one, and the whole point is to show
+ * what the panel is really doing.
+ */
+const GamePreview: React.FC<{
+  lanes: number;
+  rows: number;
+  accent: RgbColor;
+  title: string;
+  /** Which game this preview is for; frames from the other game are ignored. */
+  game: "snake" | "tetris";
+}> = ({ lanes, rows, accent, title, game }) => {
+  const [snapshot, setSnapshot] = useState<GameSnapshot | null>(null);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    listen<GameSnapshot>("game-frame", (event) => {
+      if (disposed) return;
+      // Drop frames from the other game. Without this the preview keeps showing
+      // the previous game's board after a mode switch, and for snake that means a
+      // frozen mid-game position that never matches the panel.
+      if (event.payload.game !== game) return;
+      setSnapshot(event.payload);
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {
+        // Non-Tauri (browser dev) fallback: nothing to show.
+      });
+
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, [game]);
+
+  // Belt and braces: also ignore a stored snapshot from the other game, so a mode
+  // switch can never show the wrong board even for a single frame.
+  const current = snapshot && snapshot.game === game ? snapshot : null;
+
+  // Fall back to a blank grid until the first frame arrives, so the preview keeps
+  // its shape instead of collapsing and making the panel jump.
+  const grid: (number | null)[][] =
+    current?.lanes ??
+    Array.from({ length: lanes }, () => new Array(rows).fill(null));
+
+  return (
+    <div className="flex items-start gap-3">
+      <div className="flex gap-1.5 p-2 rounded-lg bg-slate-950/80 border border-white/[0.06] w-fit">
+        {grid.map((lane, laneIdx) => (
+          <div key={laneIdx} className="flex flex-col-reverse gap-[2px]">
+            {lane.map((idx, rowIdx) => (
+              <span
+                key={rowIdx}
+                className="h-1.5 w-1.5 rounded-full"
+                style={{
+                  backgroundColor:
+                    idx === null ? "#1e293b" : gameColor(idx, accent),
+                }}
+              />
+            ))}
+          </div>
+        ))}
+      </div>
+      <div className="flex flex-col gap-0.5 text-[10px] font-mono text-slate-500">
+        <span className="text-slate-400">{title}</span>
+        <span>
+          {lanes} × {rows}
+        </span>
+        {!current && <span className="text-amber-400">waiting…</span>}
+        {current?.flashing && (
+          <span className="text-emerald-400 font-semibold">
+            CLEAR {(current.clearing_rows ?? []).join(", ")}
+          </span>
+        )}
+        {current !== null && current.cleared > 0 && (
+          <span>lines {current.cleared}</span>
+        )}
+      </div>
+    </div>
+  );
+};
+
+/** Diagnostic patterns exposed on the Debug page. */
+const DEBUG_PATTERNS: {
+  id: string;
+  name: string;
+  what: string;
+  how: string;
+}[] = [
+  {
+    id: "off",
+    name: "Off",
+    what: "Normal lighting output.",
+    how: "Use this to leave test mode.",
+  },
+  {
+    id: "all_white",
+    name: "All White",
+    what: "Lights every LED solid white.",
+    how: "Count how many LEDs actually light up. Any dark gaps are dead, unsupported, or wired past the end of the strip.",
+  },
+  {
+    id: "count",
+    name: "Count Marker",
+    what: "Repeats 10 red / 10 green / 10 blue / 10 white.",
+    how: "Count the first red run, then multiply by the number of full colour groups. Sum the partial final group for the exact total.",
+  },
+  {
+    id: "single",
+    name: "Single LED",
+    what: "Lights exactly one LED at the index you choose.",
+    how: "Step through indices one at a time. If extra LEDs light at the same moment, they are wired in PARALLEL to that channel. Only one lighting means TRUE daisy-chain.",
+  },
+  {
+    id: "snake",
+    name: "Snake (Index Tracer)",
+    what: "A pulse walks the strip one LED at a time, with a dim ruler every 10th LED.",
+    how: "Use the LED number box to read or jump to a position. Type an index and the snake pins there, so you can confirm exactly which physical LED that index maps to.",
+  },
+  {
+    id: "tens",
+    name: "Ruler (every 10th)",
+    what: "Lights every 10th LED bright, every 5th dim.",
+    how: "A numbered ruler that survives losing your place while counting a long strip.",
+  },
+  {
+    id: "halves",
+    name: "Halves",
+    what: "First half red, second half blue.",
+    how: "If the two halves look reversed or interleaved on your hardware, the strip is mirrored between channels.",
+  },
+];
+
+/** 32-band audio meter. Memoized; bars snap straight to each reading, no tweening. */
+const AudioBars = memo(function AudioBars({ bands }: { bands: number[] }) {
+  return (
+    <div className="flex h-11 items-end gap-[2px] px-0.5">
+      {bands.map((band, idx) => (
+        <div
+          key={idx}
+          className="flex-1 rounded-[1px] bg-slate-800/60 relative overflow-hidden"
+          style={{ height: "100%" }}
+          title={`Band ${idx + 1}: ${Math.round(band * 100)}%`}
+        >
+          <div
+            className="w-full absolute bottom-0 rounded-[1px] origin-bottom"
+            style={{
+              height: "100%",
+              backgroundColor: BAND_HUES[idx],
+              transform: `scaleY(${Math.min(1, Math.max(0.04, band))})`,
+            }}
+          />
+        </div>
+      ))}
+    </div>
+  );
+});
+
 const rgbToHex = (r: number, g: number, b: number) => {
   return (
     "#" +
@@ -162,7 +694,7 @@ export default function App() {
   });
 
   const [activeTab, setActiveTab] = useState<
-    "lighting" | "diagnostics" | "profiles" | "settings"
+    "lighting" | "diagnostics" | "debug" | "profiles" | "settings"
   >(() => {
     try {
       const saved =
@@ -191,13 +723,13 @@ export default function App() {
           static_color: color,
           current_color: color,
           cpu_usage: 0,
-          cpu_temp: 45,
+          cpu_temp: null,
           active_app: "Desktop",
           is_coding_detected: false,
           is_gaming_detected: false,
           devices: [],
-          led_count: parsed.led_count || 120,
-          audio_bands: new Array(32).fill(0),
+          led_count: parsed.led_count || 40,
+          audio_bands: new Array(NUM_BANDS).fill(0),
           audio_sensitivity:
             parsed.audio_sensitivity !== undefined
               ? parsed.audio_sensitivity
@@ -212,13 +744,13 @@ export default function App() {
       static_color: { r: 0, g: 210, b: 255 },
       current_color: { r: 0, g: 210, b: 255 },
       cpu_usage: 0,
-      cpu_temp: 45,
+      cpu_temp: null,
       active_app: "Desktop",
       is_coding_detected: false,
       is_gaming_detected: false,
       devices: [],
-      led_count: 120,
-      audio_bands: new Array(32).fill(0),
+      led_count: 40,
+      audio_bands: new Array(NUM_BANDS).fill(0),
       audio_sensitivity: 1.0,
     };
   });
@@ -226,17 +758,39 @@ export default function App() {
   const [notification, setNotification] = useState<string | null>(null);
   const [startingOpenRgb, setStartingOpenRgb] = useState(false);
 
+  // Debug page state
+  const [debugIndex, setDebugIndex] = useState(0);
+  const [debugPaused, setDebugPaused] = useState(false);
+  // Prevents the poll from overwriting the index box while it is being typed in.
+  const indexInputFocused = useRef(false);
+  // Marquee message for Text mode.
+  const [marqueeText, setMarqueeText] = useState("BETTERRGB");
+  const [marqueeSpeed, setMarqueeSpeed] = useState(14);
+  const marqueeInputFocused = useRef(false);
+  // Play-speed multiplier for the Snake and Tetris demos.
+  const [gameSpeed, setGameSpeed] = useState(1.0);
+  // Physical grid arrangement. Defaults match the confirmed fan: 3 lanes of 13,
+  // index 0 unwired, every lane running bottom to top.
+  const [laneConfig, setLaneConfig] = useState<PanelLayout>({
+    lanes: 3,
+    leds_per_lane: 13,
+    first_index: 1,
+    serpentine: false,
+    bass_at_top: false,
+  });
+
+  // Audio bands arrive as a pushed event at engine tick rate (~30/s). Polling
+  // could only deliver ~4/s, which made the meter look like a 1-2 Hz animation.
+  const [liveBands, setLiveBands] = useState<number[]>(() =>
+    new Array(NUM_BANDS).fill(0),
+  );
+
+  // Mirrors `state` for read access inside the polling loop without adding a dep.
+  const prevStateRef = useRef<AppStatePayload | null>(null);
+
   // Autostart setting state
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [loadingAutostart, setLoadingAutostart] = useState(false);
-
-  // Telemetry Sparkline History Buffers
-  const [tempHistory, setTempHistory] = useState<number[]>([
-    45, 46, 45, 47, 46,
-  ]);
-  const [loadHistory, setLoadHistory] = useState<number[]>([
-    10, 15, 12, 18, 14,
-  ]);
 
   // QOL: User Custom Profiles Saved in localStorage
   const [customProfiles, setCustomProfiles] = useState<Profile[]>(() => {
@@ -350,26 +904,136 @@ export default function App() {
     activeTab,
   ]);
 
-  // Poll state from Rust backend every 100ms
+  // Push-based audio bands from the engine. Runs at tick rate so the meter
+  // tracks the audio directly instead of being limited by the poll interval.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<number[]>("audio-bands", (event) => {
+      setLiveBands(event.payload);
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        // Not running inside Tauri
+      });
+    return () => unlisten?.();
+  }, []);
+
+  // Adaptive state polling. Uses the Tauri window API rather than document.hidden,
+  // which stays false when the window is hidden to tray. Backs off to a slow poll
+  // when hidden and self-schedules to avoid overlapping requests.
   useEffect(() => {
     let isMounted = true;
-    const interval = setInterval(async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let active = true;
+    const POLL_ACTIVE_MS = 250; // visible+centered: matches the original cadence
+    const POLL_IDLE_MS = 500; // visible but unfocused
+    const POLL_HIDDEN_MS = 15000; // tray-only: near-zero wakeups
+
+    const fetchState = async () => {
       try {
         const res = await invoke<AppStatePayload>("get_state");
-        if (isMounted) {
-          setState(res);
-          // Append to sparkline histories
-          setTempHistory((prev) => [...prev.slice(-24), res.cpu_temp]);
-          setLoadHistory((prev) => [...prev.slice(-24), res.cpu_usage]);
+        if (!isMounted) return;
+
+        // Bail out before touching state when nothing changed, to avoid a re-render
+        // that would restart every CSS transition in the tree. The previous payload
+        // is tracked in a ref so this comparison stays outside the state updater.
+        // Audio bands are excluded - they arrive via the push event above.
+        // Debug fields ARE included, otherwise a travelling snake would be skipped
+        // and the index readout would freeze.
+        const prev = prevStateRef.current;
+
+        const unchanged =
+          prev !== null &&
+          prev.connected === res.connected &&
+          prev.active_mode === res.active_mode &&
+          prev.current_color.r === res.current_color.r &&
+          prev.current_color.g === res.current_color.g &&
+          prev.current_color.b === res.current_color.b &&
+          prev.cpu_temp === res.cpu_temp &&
+          prev.cpu_usage === res.cpu_usage &&
+          prev.active_app === res.active_app &&
+          prev.is_coding_detected === res.is_coding_detected &&
+          prev.is_gaming_detected === res.is_gaming_detected &&
+          prev.devices.length === res.devices.length &&
+          prev.debug === res.debug &&
+          prev.debug_index === res.debug_index &&
+          prev.debug_paused === res.debug_paused;
+
+        if (unchanged) return;
+
+        prevStateRef.current = res;
+        setState(res);
+
+        // Keep the snake's position control in sync with the engine. Skipped
+        // while the user is typing so the field doesn't fight their input.
+        if (res.debug === "snake" && !res.debug_paused) {
+          if (!indexInputFocused.current) {
+            setDebugIndex(res.debug_index ?? 0);
+          }
+        }
+        if (res.debug_paused !== undefined) {
+          setDebugPaused(res.debug_paused);
+        }
+        if (res.layout) {
+          setLaneConfig(res.layout);
+        }
+        if (res.marquee_text !== undefined && !marqueeInputFocused.current) {
+          setMarqueeText(res.marquee_text);
+        }
+        if (res.game_speed !== undefined) {
+          setGameSpeed(res.game_speed);
         }
       } catch {
         // Dev server fallback
       }
-    }, 100);
+    };
+
+    const loop = async () => {
+      if (!isMounted) return;
+
+      // Determine true visibility/minimised state from the OS window, not the DOM.
+      let focused = true;
+      let visible = true;
+      try {
+        const win = getCurrentWindow();
+        focused = await win.isFocused();
+        visible = await win.isVisible();
+      } catch {
+        // Non-Tauri (browser dev) fallback
+        visible = typeof document === "undefined" || !document.hidden;
+      }
+      active = visible;
+
+      if (visible) {
+        await fetchState();
+      }
+
+      const delay = !visible
+        ? POLL_HIDDEN_MS
+        : focused && active
+          ? POLL_ACTIVE_MS
+          : POLL_IDLE_MS;
+
+      if (isMounted) timer = setTimeout(loop, delay);
+    };
+
+    loop();
+
+    // Coming back to the window or un-minimising should refresh immediately
+    // rather than waiting for the next slow idle tick.
+    const wake = () => {
+      if (!isMounted) return;
+      clearTimeout(timer);
+      loop();
+    };
+    document.addEventListener("visibilitychange", wake);
 
     return () => {
       isMounted = false;
-      clearInterval(interval);
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", wake);
     };
   }, []);
 
@@ -468,6 +1132,85 @@ export default function App() {
     }
   };
 
+  const handleSetDebugPattern = async (pattern: string) => {
+    try {
+      await invoke("set_debug_pattern", { pattern });
+      // Snake resumes travelling whenever it is (re)started.
+      if (pattern === "snake") {
+        await invoke("set_debug_paused", { paused: false });
+      }
+    } catch (e: any) {
+      showToast(`Debug error: ${e}`);
+    }
+  };
+
+  // Jump to an exact index. Pins the snake so the LED you asked for stays lit.
+  const handleSetDebugIndex = async (index: number) => {
+    setDebugIndex(index);
+    try {
+      await invoke("set_debug_index", { index, pause: true });
+    } catch (e: any) {
+      showToast(`Debug error: ${e}`);
+    }
+  };
+
+  const handleToggleDebugPause = async () => {
+    const next = !debugPaused;
+    setDebugPaused(next);
+    try {
+      await invoke("set_debug_paused", { paused: next });
+    } catch (e: any) {
+      showToast(`Debug error: ${e}`);
+    }
+  };
+
+  const handleLaneChange = async (next: Partial<PanelLayout>) => {
+    const merged = { ...laneConfig, ...next };
+    setLaneConfig(merged);
+    try {
+      await invoke("set_lane_layout", {
+        lanes: merged.lanes,
+        ledsPerLane: merged.leds_per_lane,
+        firstIndex: merged.first_index,
+        serpentine: merged.serpentine,
+        bassAtTop: merged.bass_at_top,
+      });
+      // Keep the total LED count in step with the grid, so the effect always
+      // covers the real hardware and unused slots stay dark.
+      const total = merged.first_index + merged.lanes * merged.leds_per_lane;
+      if (total !== state.led_count) {
+        await invoke("set_led_count", { count: total });
+      }
+    } catch (e: any) {
+      showToast(`Layout error: ${e}`);
+    }
+  };
+
+  const handleVizStyle = async (style: string) => {
+    try {
+      await invoke("set_viz_style", { style });
+    } catch (e: any) {
+      showToast(`Visualizer error: ${e}`);
+    }
+  };
+
+  const handleMarqueeText = (text: string) => {
+    // Local update keeps typing responsive; the backend filters unsupported
+    // characters and is the source of truth on the next poll.
+    setMarqueeText(text);
+    invoke("set_marquee_text", { text }).catch(() => {});
+  };
+
+  const handleMarqueeSpeed = (speed: number) => {
+    setMarqueeSpeed(speed);
+    invoke("set_marquee_speed", { speed }).catch(() => {});
+  };
+
+  const handleGameSpeed = (speed: number) => {
+    setGameSpeed(speed);
+    invoke("set_game_speed", { speed }).catch(() => {});
+  };
+
   // QOL: Hardware Ping Pulse (flashes White then returns to current mode)
   const handlePingHardware = async () => {
     showToast("Pinging ARGB headers with White signal pulse...");
@@ -537,97 +1280,102 @@ export default function App() {
 
   const isOff = state.active_mode === "off";
 
-  const MODES_LIST = [
-    {
-      id: "smart",
-      name: "Smart Autonomous",
-      description:
-        "Auto-detects active coding vs gaming and dynamically adjusts color tone & glare.",
-      icon: Sparkles,
-      color: "rgba(0, 210, 255, 0.16)",
-      glow: "#00d2ff",
-    },
-    {
-      id: "appsync",
-      name: "Adaptive App Glow",
-      description:
-        "Extracts brand colors directly from the foreground app's logo/icon and illuminates your PC.",
-      icon: AppWindow,
-      color: "rgba(0, 210, 255, 0.16)",
-      glow: "#00d2ff",
-    },
-    {
-      id: "coding",
-      name: "Arctic Code Focus",
-      description:
-        "Deep, glare-free arctic focus tone dimmed to 35% to protect night vision.",
-      icon: Code,
-      color: "rgba(56, 189, 248, 0.16)",
-      glow: "#38bdf8",
-    },
-    {
-      id: "thermal",
-      name: "Thermal Sentinel",
-      description:
-        "Direct real-time hardware temperature heat-mapping from Cool Green to Blazing Red.",
-      icon: Flame,
-      color: "rgba(249, 115, 22, 0.16)",
-      glow: "#f97316",
-    },
-    {
-      id: "visualizer",
-      name: "WASAPI Visualizer",
-      description:
-        "Ripples live system audio beats & frequency bands across all connected fans.",
-      icon: Volume2,
-      color: "rgba(168, 85, 247, 0.16)",
-      glow: "#a855f7",
-    },
-    {
-      id: "rainbow",
-      name: "Spectrum Wave",
-      description:
-        "Continuous ultra-smooth 360-degree rainbow stream across all ARGB headers.",
-      icon: Radio,
-      color: "rgba(16, 185, 129, 0.16)",
-      glow: "#10b981",
-    },
-    {
-      id: "breathing",
-      name: "Circadian Pulse",
-      description:
-        "Gentle rhythmic fading breath cycle on your chosen custom accent color.",
-      icon: Waves,
-      color: "rgba(234, 179, 8, 0.16)",
-      glow: "#eab308",
-    },
-    {
-      id: "static",
-      name: "Static Custom Accent",
-      description:
-        "Locks solid custom neon hue across all motherboard zones and fan hubs.",
-      icon: Palette,
-      color: "rgba(255, 255, 255, 0.12)",
-      glow: "#ffffff",
-    },
-  ];
+  // Audio and CPU telemetry are only surfaced for the modes that actually
+  // consume them. In Smart/auto they stay hidden by default.
+  const audioActive = state.active_mode === "visualizer";
+  const telemetryActive =
+    state.active_mode === "thermal" || state.active_mode === "gaming";
+
+  // Game console: speed control plus a live view of the real board. Rendered in
+  // both the Lighting tab (as the counterpart to the visualizer banner) and the
+  // Debug tab, so it is reachable wherever the mode was switched on.
+  const isGameMode =
+    state.active_mode === "snake" || state.active_mode === "tetris";
+  const gamePanel = isGameMode ? (
+    <div className="glass-panel rounded-2xl p-5 flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+          {state.active_mode === "tetris" ? (
+            <Blocks className="h-3.5 w-3.5 text-sky-400" />
+          ) : (
+            <Gamepad2 className="h-3.5 w-3.5 text-emerald-400" />
+          )}
+          {state.active_mode === "tetris" ? "Tetris Demo" : "Snake Demo"}
+        </span>
+        <span className="text-[10px] px-2 py-0.5 rounded-full bg-white/[0.06] border border-white/[0.1] text-slate-400 font-semibold">
+          Auto-play
+        </span>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <span className="text-[10px] text-slate-400 shrink-0">Speed</span>
+        <input
+          type="range"
+          min={0.25}
+          max={4}
+          step={0.25}
+          value={gameSpeed}
+          onChange={(e) => handleGameSpeed(parseFloat(e.target.value) || 1)}
+          className="flex-1 cursor-pointer"
+        />
+        <span className="text-[11px] font-mono text-slate-300 w-14 text-right">
+          {gameSpeed.toFixed(2)}×
+        </span>
+      </div>
+
+      <div className="flex gap-1.5">
+        {[0.5, 1, 2, 3].map((v) => (
+          <button
+            key={v}
+            onClick={() => handleGameSpeed(v)}
+            className={`flex-1 px-2 py-1 rounded-lg border text-[10px] font-semibold transition-all cursor-pointer ${
+              gameSpeed === v
+                ? "border-cyan-400 bg-cyan-500/20 text-cyan-300"
+                : "border-white/[0.1] bg-white/[0.04] text-slate-400 hover:bg-white/[0.08]"
+            }`}
+          >
+            {v}×
+          </button>
+        ))}
+      </div>
+
+      {/* Live board streamed from the engine, not simulated here. */}
+      <div className="flex flex-col gap-1.5">
+        <span className="text-[10px] text-slate-400">
+          Live preview ({laneConfig.lanes} lanes × {laneConfig.leds_per_lane}{" "}
+          rows)
+        </span>
+        <GamePreview
+          key={state.active_mode}
+          game={state.active_mode === "tetris" ? "tetris" : "snake"}
+          lanes={laneConfig.lanes}
+          rows={laneConfig.leds_per_lane}
+          accent={state.static_color}
+          title={state.active_mode === "tetris" ? "Stacking" : "Hunting food"}
+        />
+      </div>
+
+      <p className="text-[11px] text-slate-500 leading-relaxed">
+        {state.active_mode === "tetris"
+          ? "Pieces spawn at the top, rotate to the chosen orientation, then fall one row at a time. A completed line flashes before it clears, and the stack pauses while it does."
+          : "The snake hunts for food and avoids itself, restarting automatically when it dies. Its head is the bright tip."}
+      </p>
+    </div>
+  ) : null;
 
   return (
     <div className="relative flex h-screen w-screen flex-col bg-[#07090e] text-slate-100 overflow-hidden font-sans">
-      {/* Tactile Noise Texture Overlay */}
-      <div className="noise-overlay" />
-
-      {/* Dynamic Aurora Mesh Glow Blobs (Reacts to live RGB) */}
-      <div className="pointer-events-none fixed inset-0 overflow-hidden z-0">
-        <div
-          className="absolute -top-36 left-1/4 h-96 w-96 rounded-full blur-[140px] opacity-25 transition-all duration-1000"
-          style={{ backgroundColor: isOff ? "transparent" : currentColorHex }}
-        />
-        <div
-          className="absolute -bottom-36 right-1/4 h-96 w-96 rounded-full blur-[160px] opacity-20 transition-all duration-1000"
-          style={{ backgroundColor: isOff ? "transparent" : currentColorHex }}
-        />
-      </div>
+      {/* Aurora ambient glow. Plain radial gradients instead of large blur-radius
+          layers, which are expensive to rasterize and were re-rasterized on every colour change. */}
+      <div
+        className="pointer-events-none fixed inset-0 z-0"
+        style={{
+          opacity: 0.25,
+          background: isOff
+            ? "none"
+            : `radial-gradient(600px circle at 25% 12%, ${currentColorHex}59, transparent 70%), radial-gradient(600px circle at 75% 88%, ${currentColorHex}38, transparent 70%)`,
+        }}
+      />
 
       {/* Custom Draggable Frameless Titlebar */}
       <TitleBar
@@ -642,25 +1390,18 @@ export default function App() {
         onCancelSleepTimer={handleCancelSleepTimer}
       />
 
-      {/* Toast Notification */}
-      <AnimatePresence>
-        {notification && (
-          <motion.div
-            initial={{ opacity: 0, y: -16, scale: 0.95 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -16, scale: 0.95 }}
-            className="absolute top-14 right-6 z-50 flex items-center gap-2.5 rounded-xl border border-cyan-400/30 bg-slate-900/95 px-4 py-2.5 text-xs font-medium shadow-2xl backdrop-blur-xl"
-          >
-            <Zap className="h-4 w-4 text-cyan-400 animate-pulse" />
-            <span className="text-slate-200">{notification}</span>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {/* Toast Notification (CSS-animated; no framer-motion runtime needed) */}
+      {notification && (
+        <div className="toast-anim absolute top-14 right-6 z-50 flex items-center gap-2.5 rounded-xl border border-cyan-400/30 bg-slate-900 px-4 py-2.5 text-xs font-medium shadow-2xl">
+          <Zap className="h-4 w-4 text-cyan-400" />
+          <span className="text-slate-200">{notification}</span>
+        </div>
+      )}
 
       {/* App Workspace Body */}
       <div className="flex-1 flex overflow-hidden relative z-10">
         {/* Left Navigation & Telemetry Sidebar */}
-        <aside className="w-80 border-r border-white/[0.08] bg-[#090d16]/70 backdrop-blur-2xl flex flex-col justify-between p-4 shrink-0 overflow-y-auto">
+        <aside className="w-80 border-r border-white/[0.08] bg-[#090d16] flex flex-col justify-between p-4 shrink-0 overflow-y-auto">
           <div className="flex flex-col gap-4">
             {/* Nav Switcher */}
             <div className="flex rounded-xl bg-slate-950/70 p-1 border border-white/[0.06]">
@@ -695,6 +1436,16 @@ export default function App() {
                 Health
               </button>
               <button
+                onClick={() => setActiveTab("debug")}
+                className={`flex-1 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                  activeTab === "debug"
+                    ? "bg-amber-500/20 text-amber-300 shadow-[0_0_12px_rgba(245,158,11,0.2)] border border-amber-500/30"
+                    : "text-slate-400 hover:text-white"
+                }`}
+              >
+                Debug
+              </button>
+              <button
                 onClick={() => setActiveTab("settings")}
                 className={`flex-1 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
                   activeTab === "settings"
@@ -707,7 +1458,7 @@ export default function App() {
             </div>
 
             {/* Context & Focused App Card */}
-            <div className="rounded-xl border border-white/[0.06] bg-slate-950/50 p-3.5 backdrop-blur-md">
+            <div className="rounded-xl border border-white/[0.06] bg-slate-950/70 p-3.5">
               <div className="flex items-center justify-between text-[11px] font-medium text-slate-400 mb-1.5">
                 <span className="flex items-center gap-1.5">
                   <Activity className="h-3.5 w-3.5 text-cyan-400" />
@@ -759,112 +1510,84 @@ export default function App() {
               </div>
             </div>
 
-            {/* Live Telemetry: CPU Temp Sparkline */}
-            <div className="rounded-xl border border-white/[0.06] bg-slate-950/50 p-3.5 backdrop-blur-md flex flex-col gap-2">
+            {/* Live Telemetry: CPU Temperature. Shows N/A when the machine exposes
+                no CPU thermal sensor, rather than inventing a plausible number. */}
+            <div className="rounded-xl border border-white/[0.06] bg-slate-950/70 p-3.5">
               <div className="flex items-center justify-between">
                 <span className="text-[11px] font-medium text-slate-400 flex items-center gap-1.5">
                   <Thermometer className="h-3.5 w-3.5 text-amber-400" />
                   CPU Temperature
                 </span>
                 <span
-                  className={`text-sm font-bold ${
-                    state.cpu_temp > 75
-                      ? "text-red-400"
-                      : state.cpu_temp > 60
-                        ? "text-amber-400"
-                        : "text-emerald-400"
+                  className={`text-lg font-bold tabular-nums ${
+                    state.cpu_temp === null
+                      ? "text-slate-500"
+                      : state.cpu_temp > 75
+                        ? "text-red-400"
+                        : state.cpu_temp > 60
+                          ? "text-amber-400"
+                          : "text-emerald-400"
                   }`}
+                  title={
+                    state.cpu_temp === null
+                      ? "No CPU temperature sensor is available on this system"
+                      : undefined
+                  }
                 >
-                  {Math.round(state.cpu_temp)}°C
+                  {state.cpu_temp === null
+                    ? "N/A"
+                    : `${Math.round(state.cpu_temp)}°C`}
                 </span>
               </div>
-              <TelemetrySparkline
-                data={tempHistory}
-                color={
-                  state.cpu_temp > 75
-                    ? "#ef4444"
-                    : state.cpu_temp > 60
-                      ? "#f59e0b"
-                      : "#10b981"
-                }
-                min={30}
-                max={90}
-                height={38}
-              />
             </div>
 
-            {/* Live Telemetry: CPU Load Sparkline */}
-            <div className="rounded-xl border border-white/[0.06] bg-slate-950/50 p-3.5 backdrop-blur-md flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] font-medium text-slate-400 flex items-center gap-1.5">
-                  <Cpu className="h-3.5 w-3.5 text-cyan-400" />
-                  CPU Utilization
-                </span>
-                <span className="text-sm font-bold text-cyan-300">
-                  {Math.round(state.cpu_usage)}%
-                </span>
+            {/* Live Telemetry: CPU Utilization. Only meaningful when hardware
+                temperature is driving the lighting, so it is hidden otherwise. */}
+            {telemetryActive && (
+              <div className="rounded-xl border border-white/[0.06] bg-slate-950/70 p-3.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-medium text-slate-400 flex items-center gap-1.5">
+                    <Cpu className="h-3.5 w-3.5 text-cyan-400" />
+                    CPU Utilization
+                  </span>
+                  <span className="text-lg font-bold tabular-nums text-cyan-300">
+                    {Math.round(state.cpu_usage)}%
+                  </span>
+                </div>
               </div>
-              <TelemetrySparkline
-                data={loadHistory}
-                color="#00d2ff"
-                min={0}
-                max={100}
-                height={38}
-              />
-            </div>
+            )}
 
-            {/* WASAPI Audio Realtime Spectrum Visualizer */}
-            <div className="rounded-xl border border-white/[0.06] bg-slate-950/50 p-3.5 backdrop-blur-md flex flex-col gap-2.5">
-              <div className="flex items-center justify-between text-[11px] font-medium text-slate-400">
-                <span className="flex items-center gap-1.5">
-                  <Volume2 className="h-3.5 w-3.5 text-violet-400" />
-                  WASAPI Audio Equalizer
-                </span>
-                <span className="text-[10px] font-semibold text-violet-400/90 bg-violet-500/10 px-1.5 py-0.5 rounded border border-violet-500/20">
-                  32 Bands
-                </span>
-              </div>
-              <div className="flex h-11 items-end gap-[2px] px-0.5">
-                {state.audio_bands.map((band, idx) => {
-                  const t = idx / Math.max(1, state.audio_bands.length - 1);
-                  const hue = (330 - t * 275 + 360) % 360;
-                  const barColor = `hsl(${hue}, 95%, 58%)`;
-                  return (
-                    <div
-                      key={idx}
-                      className="flex-1 rounded-[1px] bg-slate-800/60 relative overflow-hidden"
-                      style={{ height: "100%" }}
-                      title={`Band ${idx + 1}: ${Math.round(band * 100)}%`}
-                    >
-                      <div
-                        className="w-full absolute bottom-0 rounded-[1px] transition-all duration-75"
-                        style={{
-                          height: `${Math.min(100, Math.max(6, band * 100))}%`,
-                          backgroundColor: barColor,
-                          boxShadow:
-                            band > 0.3 ? `0 0 6px ${barColor}` : "none",
-                        }}
-                      />
-                    </div>
-                  );
-                })}
-              </div>
+            {/* WASAPI Audio Visualizer. Only shown for modes that consume audio,
+                so the meter isn't occupying space (or implying activity) when
+                the capture stream is shut off. */}
+            {audioActive && (
+              <div className="rounded-xl border border-white/[0.06] bg-slate-950/70 p-3.5 flex flex-col gap-2.5">
+                <div className="flex items-center justify-between text-[11px] font-medium text-slate-400">
+                  <span className="flex items-center gap-1.5">
+                    <Volume2 className="h-3.5 w-3.5 text-violet-400" />
+                    WASAPI Audio Equalizer
+                  </span>
+                  <span className="text-[10px] font-semibold text-violet-400/90 bg-violet-500/10 px-1.5 py-0.5 rounded border border-violet-500/20">
+                    {NUM_BANDS} Bands
+                  </span>
+                </div>
+                <AudioBars bands={liveBands} />
 
-              {/* Rotary Audio Sensitivity Knob */}
-              <div className="pt-2 border-t border-white/[0.06] flex items-center justify-center">
-                <RotaryKnob
-                  value={audioSensitivity}
-                  min={0.2}
-                  max={3.0}
-                  step={0.05}
-                  defaultValue={1.0}
-                  label="Sensitivity"
-                  unit="x"
-                  accentColor="#a855f7"
-                  onChange={handleSensitivityChange}
-                />
+                <div className="pt-2 border-t border-white/[0.06] flex items-center justify-center">
+                  <RotaryKnob
+                    value={audioSensitivity}
+                    min={0.2}
+                    max={3.0}
+                    step={0.05}
+                    defaultValue={1.0}
+                    label="Sensitivity"
+                    unit="x"
+                    accentColor="#a855f7"
+                    onChange={handleSensitivityChange}
+                  />
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
           {/* QOL: Quick Sleep Timer selector at bottom of sidebar */}
@@ -946,7 +1669,7 @@ export default function App() {
                             </div>
                             {isActive && (
                               <div className="flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-cyan-400/15 border border-cyan-400/30 text-cyan-300 text-[10px] font-semibold">
-                                <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-ping" />
+                                <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
                                 Active
                               </div>
                             )}
@@ -966,7 +1689,7 @@ export default function App() {
 
               {/* Visualizer Mode: Dedicated Dynamics Console Banner */}
               {state.active_mode === "visualizer" && (
-                <div className="glass-panel rounded-2xl p-5 border border-violet-500/25 bg-gradient-to-r from-violet-950/30 via-slate-900/60 to-purple-950/20 backdrop-blur-xl flex items-center justify-between shadow-[0_0_30px_rgba(168,85,247,0.08)]">
+                <div className="glass-panel rounded-2xl p-5 border border-violet-500/25 bg-gradient-to-r from-violet-950/40 via-slate-900/90 to-purple-950/30 flex items-center justify-between shadow-[0_0_30px_rgba(168,85,247,0.08)]">
                   <div className="flex flex-col gap-1.5 max-w-lg">
                     <div className="flex items-center gap-2">
                       <div className="p-1.5 rounded-lg bg-violet-500/20 border border-violet-500/30 text-violet-400 shadow-[0_0_12px_rgba(168,85,247,0.3)]">
@@ -995,6 +1718,9 @@ export default function App() {
                   />
                 </div>
               )}
+
+              {/* Game demo console, the counterpart to the visualizer banner. */}
+              {gamePanel}
 
               {/* Master Hardware Console: Brightness, ARGB Header Size & Precision Colors */}
               <div className="glass-panel rounded-2xl p-5 flex flex-col gap-5">
@@ -1053,17 +1779,27 @@ export default function App() {
                     </div>
                     <input
                       type="range"
-                      min="12"
-                      max="240"
-                      step="6"
+                      min="1"
+                      max="480"
+                      step="1"
                       value={state.led_count}
                       onChange={(e) =>
-                        handleLedCountChange(parseInt(e.target.value) || 120)
+                        handleLedCountChange(parseInt(e.target.value) || 1)
                       }
                       className="w-full cursor-pointer"
                     />
                     <div className="flex items-center gap-1.5">
-                      {[36, 60, 72, 120, 180].map((count) => (
+                      <input
+                        type="number"
+                        min={1}
+                        max={480}
+                        value={state.led_count}
+                        onChange={(e) =>
+                          handleLedCountChange(parseInt(e.target.value) || 1)
+                        }
+                        className="w-16 px-2 py-0.5 rounded bg-slate-950 border border-white/[0.1] text-[11px] font-mono text-cyan-300 text-center"
+                      />
+                      {[36, 39, 72, 120, 180].map((count) => (
                         <button
                           key={count}
                           onClick={() => handleLedCountChange(count)}
@@ -1383,23 +2119,644 @@ export default function App() {
                   state.devices.map((dev) => (
                     <div
                       key={dev.id}
-                      className="flex items-center justify-between rounded-xl bg-slate-950/60 p-3 border border-white/[0.06]"
+                      className="rounded-xl bg-slate-950/60 p-3 border border-white/[0.06] flex flex-col gap-2"
                     >
-                      <div>
-                        <div className="font-semibold text-xs text-white">
-                          {dev.name}
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="font-semibold text-xs text-white">
+                            {dev.name}
+                          </div>
+                          <div className="text-[11px] text-slate-400">
+                            ID #{dev.id} • {dev.vendor || "ASUS"} •{" "}
+                            {dev.led_count} Total Addressable LEDs
+                          </div>
                         </div>
-                        <div className="text-[11px] text-slate-400">
-                          ID #{dev.id} • {dev.vendor || "ASUS"} •{" "}
-                          {dev.led_count} Total Addressable LEDs
-                        </div>
+                        <span className="text-[11px] px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 font-medium">
+                          Device Synchronized
+                        </span>
                       </div>
-                      <span className="text-[11px] px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 font-medium">
-                        Device Synchronized
-                      </span>
+
+                      {/* Per-zone LED counts. Use these real numbers to set the
+                          header fill length so the whole colour ramp is used. */}
+                      {dev.zones && dev.zones.length > 0 && (
+                        <div className="flex flex-col gap-1 pt-1 border-t border-white/[0.06]">
+                          {dev.zones.map((z) => (
+                            <div
+                              key={z.id}
+                              className="flex items-center justify-between text-[11px]"
+                            >
+                              <span className="text-slate-400 truncate">
+                                Zone {z.id}: {z.name || "(unnamed)"}
+                              </span>
+                              <span className="font-mono text-cyan-300 shrink-0 ml-2">
+                                {z.leds_count} LEDs
+                                <span className="text-slate-500">
+                                  {" "}
+                                  (min {z.leds_min} / max {z.leds_max})
+                                </span>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))
                 )}
+              </div>
+            </div>
+          )}
+
+          {activeTab === "debug" && (
+            <div className="flex flex-col gap-5">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h2 className="text-base font-bold text-white flex items-center gap-2">
+                    <Wrench className="h-4 w-4 text-amber-400" />
+                    LED Debug & Wiring Test
+                  </h2>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Drive the hardware directly to measure the real LED count
+                    and work out how the channels are wired.
+                  </p>
+                </div>
+                <button
+                  onClick={() => handleSetDebugPattern("off")}
+                  className={`px-4 py-2 rounded-xl border text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                    (state.debug ?? "off") !== "off"
+                      ? "border-red-500/50 bg-red-500/20 text-red-300 hover:bg-red-500/30"
+                      : "border-white/[0.08] bg-white/[0.04] text-slate-400"
+                  }`}
+                >
+                  {(state.debug ?? "off") !== "off"
+                    ? "Stop Test"
+                    : "Test Inactive"}
+                </button>
+              </div>
+
+              {/* Live test status */}
+              {(state.debug ?? "off") !== "off" && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 flex items-center gap-3">
+                  <span className="h-2 w-2 rounded-full bg-amber-400 shrink-0" />
+                  <span className="text-xs text-amber-200">
+                    Test pattern active:{" "}
+                    <span className="font-bold">
+                      {DEBUG_PATTERNS.find((p) => p.id === state.debug)?.name ??
+                        state.debug}
+                    </span>
+                    {((state.debug ?? "off") === "single" ||
+                      (state.debug ?? "off") === "snake") && (
+                      <>
+                        {" "}
+                        — LED index{" "}
+                        <span className="font-mono font-bold">
+                          {debugIndex}
+                        </span>
+                        {(state.debug ?? "off") === "snake" && (
+                          <span className="text-amber-300/80">
+                            {debugPaused ? " (paused)" : " (travelling)"}
+                          </span>
+                        )}
+                      </>
+                    )}
+                    . Normal lighting is suspended.
+                  </span>
+                </div>
+              )}
+
+              {/* LED count control, scoped to testing so it can be changed
+                  without leaving the Debug page. */}
+              <div className="glass-panel rounded-2xl p-5 flex flex-col gap-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                    <Layers className="h-3.5 w-3.5 text-cyan-400" />
+                    Total LED Count
+                  </span>
+                  <span className="text-sm font-bold font-mono text-cyan-300">
+                    {state.led_count}
+                  </span>
+                </div>
+
+                <input
+                  type="range"
+                  min={1}
+                  max={480}
+                  step={1}
+                  value={state.led_count}
+                  onChange={(e) =>
+                    handleLedCountChange(parseInt(e.target.value) || 1)
+                  }
+                  className="w-full cursor-pointer"
+                />
+
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={480}
+                    value={state.led_count}
+                    onChange={(e) =>
+                      handleLedCountChange(parseInt(e.target.value) || 1)
+                    }
+                    className="w-20 px-2 py-1 rounded-lg bg-slate-950 border border-white/[0.1] text-xs font-mono text-cyan-300 text-center"
+                  />
+                  <button
+                    onClick={() => handleLedCountChange(state.led_count - 1)}
+                    className="h-8 w-8 rounded-lg border border-white/[0.1] bg-white/[0.04] text-slate-300 hover:bg-white/[0.08] font-bold cursor-pointer"
+                  >
+                    −
+                  </button>
+                  <button
+                    onClick={() => handleLedCountChange(state.led_count + 1)}
+                    className="h-8 w-8 rounded-lg border border-white/[0.1] bg-white/[0.04] text-slate-300 hover:bg-white/[0.08] font-bold cursor-pointer"
+                  >
+                    +
+                  </button>
+                  <div className="flex items-center gap-1.5 flex-1 justify-end">
+                    {[13, 39, 40, 78, 120].map((count) => (
+                      <button
+                        key={count}
+                        onClick={() => handleLedCountChange(count)}
+                        className={`px-2 py-1 text-[10px] rounded border font-medium transition-all cursor-pointer ${
+                          state.led_count === count
+                            ? "border-cyan-400 bg-cyan-500/20 text-cyan-300"
+                            : "border-white/[0.06] bg-white/[0.02] text-slate-400 hover:text-white hover:bg-white/[0.06]"
+                        }`}
+                      >
+                        {count}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  Matches the header fill length on the Lighting tab. Raise it
+                  until the pattern covers your whole strip; lower it if the
+                  pattern repeats before the strip ends. Presets cover the
+                  common sizes for your 13-per-line fans.
+                </p>
+              </div>
+
+              {/* LED grid. Effects are rendered per (row, column) because the
+                  strip is physically a grid, not a line. */}
+              <div className="glass-panel rounded-2xl p-5 flex flex-col gap-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                    <Layers className="h-3.5 w-3.5 text-emerald-400" />
+                    LED Grid
+                  </span>
+                  <span className="text-[11px] text-slate-500">
+                    {laneConfig.lanes} lanes × {laneConfig.leds_per_lane} rows
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] text-slate-400">Lanes</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={16}
+                      value={laneConfig.lanes}
+                      onChange={(e) =>
+                        handleLaneChange({
+                          lanes: Math.max(1, parseInt(e.target.value) || 1),
+                        })
+                      }
+                      className="px-2 py-1 rounded-lg bg-slate-950 border border-white/[0.1] text-xs font-mono text-emerald-300 text-center"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] text-slate-400">
+                      LEDs / lane
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={120}
+                      value={laneConfig.leds_per_lane}
+                      onChange={(e) =>
+                        handleLaneChange({
+                          leds_per_lane: Math.max(
+                            1,
+                            parseInt(e.target.value) || 1,
+                          ),
+                        })
+                      }
+                      className="px-2 py-1 rounded-lg bg-slate-950 border border-white/[0.1] text-xs font-mono text-emerald-300 text-center"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] text-slate-400">
+                      First index
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={63}
+                      value={laneConfig.first_index}
+                      onChange={(e) =>
+                        handleLaneChange({
+                          first_index: Math.max(
+                            0,
+                            parseInt(e.target.value) || 0,
+                          ),
+                        })
+                      }
+                      className="px-2 py-1 rounded-lg bg-slate-950 border border-white/[0.1] text-xs font-mono text-emerald-300 text-center"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[10px] text-slate-400">
+                    Lane direction
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      onClick={() => handleLaneChange({ serpentine: false })}
+                      className={`py-1.5 rounded-lg border text-[11px] font-semibold transition-all cursor-pointer ${
+                        !laneConfig.serpentine
+                          ? "border-emerald-400 bg-emerald-500/20 text-emerald-300"
+                          : "border-white/[0.06] bg-white/[0.02] text-slate-400 hover:text-white hover:bg-white/[0.06]"
+                      }`}
+                    >
+                      All bottom → top
+                    </button>
+                    <button
+                      onClick={() => handleLaneChange({ serpentine: true })}
+                      className={`py-1.5 rounded-lg border text-[11px] font-semibold transition-all cursor-pointer ${
+                        laneConfig.serpentine
+                          ? "border-emerald-400 bg-emerald-500/20 text-emerald-300"
+                          : "border-white/[0.06] bg-white/[0.02] text-slate-400 hover:text-white hover:bg-white/[0.06]"
+                      }`}
+                    >
+                      Serpentine
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[10px] text-slate-400">
+                    Spectrum orientation
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      onClick={() => handleLaneChange({ bass_at_top: false })}
+                      className={`py-1.5 rounded-lg border text-[11px] font-semibold transition-all cursor-pointer ${
+                        !laneConfig.bass_at_top
+                          ? "border-violet-400 bg-violet-500/20 text-violet-300"
+                          : "border-white/[0.06] bg-white/[0.02] text-slate-400 hover:text-white hover:bg-white/[0.06]"
+                      }`}
+                    >
+                      Bass at bottom
+                    </button>
+                    <button
+                      onClick={() => handleLaneChange({ bass_at_top: true })}
+                      className={`py-1.5 rounded-lg border text-[11px] font-semibold transition-all cursor-pointer ${
+                        laneConfig.bass_at_top
+                          ? "border-violet-400 bg-violet-500/20 text-violet-300"
+                          : "border-white/[0.06] bg-white/[0.02] text-slate-400 hover:text-white hover:bg-white/[0.06]"
+                      }`}
+                    >
+                      Bass at top
+                    </button>
+                  </div>
+                </div>
+
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  Matches your measured wiring: 3 lanes of 13, index 0 unwired,
+                  every lane running bottom to top. Effects are rendered on a
+                  grid, so a row spans all three lanes and stays continuous
+                  across the fan. Changing the grid also updates the total LED
+                  count to match.
+                </p>
+              </div>
+
+              {/* Visualizer style picker */}
+              <div className="glass-panel rounded-2xl p-5 flex flex-col gap-3">
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                  <Volume2 className="h-3.5 w-3.5 text-violet-400" />
+                  Visualizer Style
+                </span>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    {
+                      id: "columns",
+                      label: "Bars",
+                      note: "One vertical bar per lane: bass, mid, treble, with peak markers.",
+                    },
+                    {
+                      id: "rows",
+                      label: "Rows",
+                      note: "Each frequency band is one full-width horizontal line.",
+                    },
+                    {
+                      id: "bloom",
+                      label: "Bloom",
+                      note: "Light blooms outward from the centre row.",
+                    },
+                  ].map((s) => (
+                    <button
+                      key={s.id}
+                      onClick={() => handleVizStyle(s.id)}
+                      title={s.note}
+                      className={`py-2 rounded-lg border text-xs font-semibold transition-all cursor-pointer ${
+                        state.viz_style === s.id
+                          ? "border-violet-400 bg-violet-500/20 text-violet-300"
+                          : "border-white/[0.06] bg-white/[0.02] text-slate-400 hover:text-white hover:bg-white/[0.06]"
+                      }`}
+                    >
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  {
+                    {
+                      columns:
+                        "Bars: each lane is an independent level meter. Peak markers rise instantly and fall slowly, showing recent maxima.",
+                      rows: "Rows: all 13 rows span every lane, so each band reads as one continuous line across the fan.",
+                      bloom:
+                        "Bloom: brightness expands from the centre row outward, strongest at the middle.",
+                    }[state.viz_style ?? "columns"]
+                  }
+                </p>
+              </div>
+
+              {/* Marquee message, shown when Text mode is selected. */}
+              {(state.active_mode === "text" || activeTab === "debug") && (
+                <div className="glass-panel rounded-2xl p-5 flex flex-col gap-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                      <Type className="h-3.5 w-3.5 text-pink-400" />
+                      Scrolling Message
+                    </span>
+                    <button
+                      onClick={() => {
+                        handleSetMode("text");
+                        showToast("Scrolling message mode active");
+                      }}
+                      className={`px-3 py-1 rounded-lg border text-[11px] font-semibold transition-all cursor-pointer ${
+                        state.active_mode === "text"
+                          ? "border-pink-400 bg-pink-500/20 text-pink-300"
+                          : "border-white/[0.1] bg-white/[0.04] text-slate-300 hover:bg-white/[0.08]"
+                      }`}
+                    >
+                      {state.active_mode === "text" ? "Running" : "Run"}
+                    </button>
+                  </div>
+
+                  <input
+                    type="text"
+                    value={marqueeText}
+                    maxLength={120}
+                    placeholder="BETTERRGB"
+                    onFocus={() => {
+                      marqueeInputFocused.current = true;
+                    }}
+                    onBlur={() => {
+                      marqueeInputFocused.current = false;
+                    }}
+                    onChange={(e) => handleMarqueeText(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-white/[0.1] text-sm text-pink-200 placeholder:text-slate-600 focus:border-pink-500/50 focus:outline-none"
+                  />
+
+                  <div className="flex items-center gap-3">
+                    <span className="text-[10px] text-slate-400 shrink-0">
+                      Speed
+                    </span>
+                    <input
+                      type="range"
+                      min={1}
+                      max={60}
+                      step={1}
+                      value={marqueeSpeed}
+                      onChange={(e) =>
+                        handleMarqueeSpeed(parseInt(e.target.value) || 14)
+                      }
+                      className="flex-1 cursor-pointer"
+                    />
+                    <span className="text-[11px] font-mono text-slate-300 w-14 text-right">
+                      {marqueeSpeed} px/s
+                    </span>
+                  </div>
+
+                  {/* Live preview, animating at the same rate as the hardware. */}
+                  <div className="flex flex-col gap-1.5">
+                    <span className="text-[10px] text-slate-400">
+                      Preview (3 lanes × {laneConfig.leds_per_lane} rows)
+                    </span>
+                    <MarqueePreview
+                      text={marqueeText}
+                      speed={marqueeSpeed}
+                      lanes={laneConfig.lanes}
+                      rows={laneConfig.leds_per_lane}
+                    />
+                  </div>
+
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    Text scrolls upward one row at a time, animated here at the
+                    same rate as the panel. Letters are upright and read
+                    vertically. Supported: A–Z, 0–9 and common punctuation.
+                  </p>
+                </div>
+              )}
+
+              {/* Game demos: speed control and a live preview of the real board. */}
+              {gamePanel}
+
+              {/* Index control: used by Single (pinpoint) and Snake (trace) */}
+              {((state.debug ?? "off") === "single" ||
+                (state.debug ?? "off") === "snake") && (
+                <div className="glass-panel rounded-2xl p-5 flex flex-col gap-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                      {(state.debug ?? "off") === "snake"
+                        ? "Snake Position"
+                        : "Target LED Index"}
+                    </span>
+                    {(state.debug ?? "off") === "snake" && (
+                      <button
+                        onClick={handleToggleDebugPause}
+                        className={`px-3 py-1 rounded-lg border text-[11px] font-semibold transition-all cursor-pointer ${
+                          debugPaused
+                            ? "border-emerald-400/50 bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30"
+                            : "border-amber-400/50 bg-amber-500/20 text-amber-300 hover:bg-amber-500/30"
+                        }`}
+                      >
+                        {debugPaused ? "Resume" : "Pause"}
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={() =>
+                        handleSetDebugIndex(Math.max(0, debugIndex - 1))
+                      }
+                      className="h-9 w-9 rounded-lg border border-white/[0.1] bg-white/[0.04] text-slate-300 hover:bg-white/[0.08] font-bold cursor-pointer"
+                    >
+                      −
+                    </button>
+                    <input
+                      type="number"
+                      min={0}
+                      max={999}
+                      value={debugIndex}
+                      onFocus={() => {
+                        indexInputFocused.current = true;
+                      }}
+                      onBlur={() => {
+                        indexInputFocused.current = false;
+                      }}
+                      onChange={(e) =>
+                        handleSetDebugIndex(
+                          Math.max(0, parseInt(e.target.value) || 0),
+                        )
+                      }
+                      className="w-24 px-3 py-1.5 rounded-lg bg-slate-950 border border-amber-500/40 text-sm font-mono text-amber-300 text-center"
+                    />
+                    <button
+                      onClick={() => handleSetDebugIndex(debugIndex + 1)}
+                      className="h-9 w-9 rounded-lg border border-white/[0.1] bg-white/[0.04] text-slate-300 hover:bg-white/[0.08] font-bold cursor-pointer"
+                    >
+                      +
+                    </button>
+                    <input
+                      type="range"
+                      min={0}
+                      max={Math.max(1, state.led_count - 1)}
+                      step={1}
+                      value={debugIndex}
+                      onChange={(e) =>
+                        handleSetDebugIndex(parseInt(e.target.value) || 0)
+                      }
+                      className="flex-1 cursor-pointer"
+                    />
+                  </div>
+
+                  {/* Position readout with ruler marks every 10 LEDs */}
+                  <div className="flex flex-col gap-1.5">
+                    <div className="relative h-6 rounded-lg bg-slate-950/80 border border-white/[0.06] overflow-hidden">
+                      {Array.from({ length: 11 }, (_, k) => {
+                        const pct = k * 10;
+                        return (
+                          <div
+                            key={k}
+                            className="absolute top-0 bottom-0 w-px bg-white/15"
+                            style={{ left: `${pct}%` }}
+                          />
+                        );
+                      })}
+                      <div
+                        className="absolute top-0 bottom-0 w-0.5 bg-amber-400"
+                        style={{
+                          left: `${
+                            state.led_count > 1
+                              ? (debugIndex / (state.led_count - 1)) * 100
+                              : 0
+                          }%`,
+                        }}
+                      />
+                    </div>
+                    <div className="flex justify-between text-[9px] font-mono text-slate-500">
+                      {[0, 25, 50, 75, 100].map((pct) => (
+                        <span key={pct}>
+                          {Math.round(((state.led_count - 1) * pct) / 100)}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    {(state.debug ?? "off") === "snake"
+                      ? "The pulse travels one LED at a time. Type an index to pin it on a specific LED, then read which physical LED lights up. Pause keeps it still while you look."
+                      : "Step one index at a time and count how many LEDs light up at each step. One LED per step = true daisy-chain. Several LEDs per step = they are wired in parallel to one channel."}
+                  </p>
+                </div>
+              )}
+
+              {/* Pattern picker */}
+              <div className="grid grid-cols-2 gap-3">
+                {DEBUG_PATTERNS.filter((p) => p.id !== "off").map((p) => {
+                  const active = (state.debug ?? "off") === p.id;
+                  return (
+                    <SpotlightCard
+                      key={p.id}
+                      active={active}
+                      spotlightColor="rgba(245, 158, 11, 0.14)"
+                      className="p-4 flex flex-col gap-2 h-full"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <h3 className="font-bold text-sm text-white">
+                          {p.name}
+                        </h3>
+                        <button
+                          onClick={() => handleSetDebugPattern(p.id)}
+                          className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold transition-all cursor-pointer shrink-0 ${
+                            active
+                              ? "border-amber-400 bg-amber-500/20 text-amber-300"
+                              : "border-white/[0.1] bg-white/[0.04] text-slate-300 hover:bg-white/[0.08]"
+                          }`}
+                        >
+                          {active ? "Running" : "Run"}
+                        </button>
+                      </div>
+                      <p className="text-[11px] font-medium text-slate-300">
+                        {p.what}
+                      </p>
+                      <p className="text-[11px] text-slate-500 leading-relaxed">
+                        {p.how}
+                      </p>
+                    </SpotlightCard>
+                  );
+                })}
+              </div>
+
+              {/* Recommended procedure */}
+              <div className="glass-panel rounded-2xl p-5 flex flex-col gap-3">
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                  Suggested Order
+                </span>
+                <ol className="flex flex-col gap-2 text-[11px] text-slate-400 leading-relaxed list-decimal list-inside">
+                  <li>
+                    <span className="text-slate-300">All White</span> — count
+                    how many LEDs respond at all. This is your upper bound.
+                  </li>
+                  <li>
+                    <span className="text-slate-300">Ruler (every 10th)</span> —
+                    use this to count a long strip without losing your place.
+                  </li>
+                  <li>
+                    <span className="text-slate-300">Count Marker</span> — read
+                    the exact total from the colour groups.
+                  </li>
+                  <li>
+                    <span className="text-slate-300">Single LED</span> — step
+                    through to detect parallel-wired LEDs.
+                  </li>
+                  <li>
+                    <span className="text-slate-300">Snake</span> — walk the
+                    pulse to map each index to a physical LED.
+                  </li>
+                  <li>
+                    <span className="text-slate-300">Halves</span> — confirm the
+                    addressing direction and any mirroring.
+                  </li>
+                  <li>
+                    Enter the total in{" "}
+                    <span className="text-slate-300">
+                      Addressable Header Fill Length
+                    </span>{" "}
+                    on the Lighting tab, then press{" "}
+                    <span className="text-slate-300">Stop Test</span>.
+                  </li>
+                </ol>
+                <p className="text-[11px] text-slate-500 pt-2 border-t border-white/[0.06] leading-relaxed">
+                  Tip: if the pattern only covers part of the strip, your
+                  configured LED count is lower than the physical count. If the
+                  strip repeats the pattern early, it is higher.
+                </p>
               </div>
             </div>
           )}

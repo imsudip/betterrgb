@@ -212,7 +212,7 @@ export const RotaryKnob: React.FC<RotaryKnobProps> = ({
 
           {/* Preset Buttons */}
           <div className="grid grid-cols-4 gap-1">
-            {[0.5, 1.0, 1.5, 2.0].map((preset) => {
+            {[0.6, 1.0, 1.6, 2.4].map((preset) => {
               const isActive = Math.abs(value - preset) < 0.04;
               return (
                 <button
@@ -231,11 +231,11 @@ export const RotaryKnob: React.FC<RotaryKnobProps> = ({
           </div>
 
           <span className="text-[9px] text-slate-500 leading-tight">
-            {value < 0.9
-              ? "Quiet audio"
-              : value > 1.4
-                ? "High dynamic boost"
-                : "Balanced pickup"}
+            {value < 0.85
+              ? "Subtle - quieter passages stay calm"
+              : value > 1.5
+                ? "Boost - reacts to faint detail"
+                : "Default - tuned for typical music"}
           </span>
         </div>
       </div>

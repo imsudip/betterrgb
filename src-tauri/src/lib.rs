@@ -1,10 +1,12 @@
 mod audio;
 mod engine;
+mod font;
+mod games;
 mod openrgb;
 mod sensors;
 
 use audio::AudioVisualizer;
-use engine::{AppMode, AppStatePayload, RgbEngine};
+use engine::{AppMode, AppStatePayload, DebugPattern, PanelLayout, RgbEngine, VizStyle};
 use openrgb::RgbColor;
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,6 +29,12 @@ struct PersistentConfig {
     color_b: u8,
     led_count: u32,
     audio_sensitivity: f32,
+    #[serde(default)]
+    marquee_text: Option<String>,
+    #[serde(default)]
+    marquee_speed: Option<f32>,
+    #[serde(default)]
+    game_speed: Option<f32>,
 }
 
 fn get_config_path() -> PathBuf {
@@ -59,6 +67,9 @@ fn save_persistent_config(state: &AppState) {
         AppMode::Breathing => "breathing",
         AppMode::Rainbow => "rainbow",
         AppMode::AppSync => "appsync",
+        AppMode::Text => "text",
+        AppMode::Snake => "snake",
+        AppMode::Tetris => "tetris",
         AppMode::Off => "off",
     };
     let data = PersistentConfig {
@@ -69,6 +80,9 @@ fn save_persistent_config(state: &AppState) {
         color_b: cfg.static_color.b,
         led_count: cfg.led_count,
         audio_sensitivity: state.audio.get_sensitivity(),
+        marquee_text: Some(cfg.marquee_text.clone()),
+        marquee_speed: Some(cfg.marquee_speed),
+        game_speed: Some(cfg.game_speed),
     };
     let path = get_config_path();
     if let Ok(json) = serde_json::to_string_pretty(&data) {
@@ -95,7 +109,7 @@ fn load_persistent_config(engine: &Arc<RgbEngine>, audio: &Arc<AudioVisualizer>)
             };
             let color = RgbColor::new(cfg.color_r, cfg.color_g, cfg.color_b);
             let b = cfg.brightness.clamp(0.0, 1.0);
-            let count = cfg.led_count.clamp(1, 240);
+            let count = cfg.led_count.clamp(1, 1000);
             let sens = cfg.audio_sensitivity.clamp(0.1, 5.0);
 
             if let Ok(mut engine_cfg) = engine.config.lock() {
@@ -103,6 +117,17 @@ fn load_persistent_config(engine: &Arc<RgbEngine>, audio: &Arc<AudioVisualizer>)
                 engine_cfg.brightness = b;
                 engine_cfg.static_color = color.clone();
                 engine_cfg.led_count = count;
+                if let Some(t) = cfg.marquee_text {
+                    if !t.trim().is_empty() {
+                        engine_cfg.marquee_text = t;
+                    }
+                }
+                if let Some(s) = cfg.marquee_speed {
+                    engine_cfg.marquee_speed = s.clamp(1.0, 60.0);
+                }
+                if let Some(g) = cfg.game_speed {
+                    engine_cfg.game_speed = g.clamp(0.25, 4.0);
+                }
             }
             if let Ok(mut payload) = engine.state_payload.lock() {
                 payload.active_mode = target_mode;
@@ -138,6 +163,9 @@ fn set_mode(mode: String, state: State<'_, AppState>) -> Result<(), String> {
         "breathing" => AppMode::Breathing,
         "rainbow" => AppMode::Rainbow,
         "appsync" => AppMode::AppSync,
+        "text" => AppMode::Text,
+        "snake" => AppMode::Snake,
+        "tetris" => AppMode::Tetris,
         "off" => AppMode::Off,
         other => return Err(format!("Unknown mode: {}", other)),
     };
@@ -145,6 +173,46 @@ fn set_mode(mode: String, state: State<'_, AppState>) -> Result<(), String> {
     {
         let mut cfg = state.inner().engine.config.lock().unwrap();
         cfg.mode = target_mode;
+    }
+    save_persistent_config(state.inner());
+    Ok(())
+}
+
+/// Set the message shown by Text mode. Filtered to characters the bitmap font
+/// can actually render, and length-capped so the buffer stays bounded.
+#[tauri::command]
+fn set_marquee_text(text: String, state: State<'_, AppState>) -> Result<(), String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || " .,!?:-_+/'=():<>".contains(*c))
+        .take(120)
+        .collect();
+    {
+        let mut cfg = state.inner().engine.config.lock().unwrap();
+        cfg.marquee_text = cleaned;
+    }
+    save_persistent_config(state.inner());
+    Ok(())
+}
+
+/// Set the marquee scroll speed in pixels per second.
+#[tauri::command]
+fn set_marquee_speed(speed: f32, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut cfg = state.inner().engine.config.lock().unwrap();
+        cfg.marquee_speed = speed.clamp(1.0, 60.0);
+    }
+    save_persistent_config(state.inner());
+    Ok(())
+}
+
+/// Set the play-speed multiplier for the Snake and Tetris demos.
+/// 1.0 is the tuned default; higher is faster.
+#[tauri::command]
+fn set_game_speed(speed: f32, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut cfg = state.inner().engine.config.lock().unwrap();
+        cfg.game_speed = speed.clamp(0.25, 4.0);
     }
     save_persistent_config(state.inner());
     Ok(())
@@ -174,9 +242,97 @@ fn set_static_color(r: u8, g: u8, b: u8, state: State<'_, AppState>) -> Result<(
 fn set_led_count(count: u32, state: State<'_, AppState>) -> Result<(), String> {
     {
         let mut cfg = state.inner().engine.config.lock().unwrap();
-        cfg.led_count = count.clamp(1, 240);
+        cfg.led_count = count.clamp(1, 1000);
     }
     save_persistent_config(state.inner());
+    Ok(())
+}
+
+/// Set the diagnostic test pattern shown on the hardware (Debug page).
+#[tauri::command]
+fn set_debug_pattern(pattern: String, state: State<'_, AppState>) -> Result<(), String> {
+    let parsed = match pattern.to_lowercase().as_str() {
+        "off" => DebugPattern::Off,
+        "all_white" => DebugPattern::AllWhite,
+        "count" => DebugPattern::Count,
+        "snake" => DebugPattern::Snake,
+        "single" => DebugPattern::Single,
+        "tens" => DebugPattern::Tens,
+        "halves" => DebugPattern::Halves,
+        other => return Err(format!("Unknown debug pattern: {}", other)),
+    };
+    {
+        let mut cfg = state.inner().engine.config.lock().unwrap();
+        cfg.debug = parsed;
+    }
+    Ok(())
+}
+
+/// Set the focus LED index, and optionally pin the snake so it stops travelling.
+/// Jumping to an index always pauses, so the LED you asked for stays lit.
+#[tauri::command]
+fn set_debug_index(
+    index: u32,
+    pause: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.inner().engine.config.lock().unwrap();
+        cfg.debug_index = index.min(999);
+        cfg.debug_jump = true;
+        if let Some(p) = pause {
+            cfg.debug_paused = p;
+        }
+    }
+    Ok(())
+}
+
+/// Resume or pause the snake without changing its current position.
+#[tauri::command]
+fn set_debug_paused(paused: bool, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut cfg = state.inner().engine.config.lock().unwrap();
+        cfg.debug_paused = paused;
+    }
+    Ok(())
+}
+
+/// Configure how the physical LEDs are arranged as a grid.
+#[tauri::command]
+fn set_lane_layout(
+    lanes: u32,
+    leds_per_lane: u32,
+    first_index: u32,
+    serpentine: bool,
+    bass_at_top: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.inner().engine.config.lock().unwrap();
+        cfg.layout = PanelLayout {
+            lanes: lanes.clamp(1, 16),
+            leds_per_lane: leds_per_lane.clamp(1, 120),
+            first_index: first_index.min(63),
+            serpentine,
+            bass_at_top,
+        };
+    }
+    Ok(())
+}
+
+/// Choose the audio visualizer rendering style.
+#[tauri::command]
+fn set_viz_style(style: String, state: State<'_, AppState>) -> Result<(), String> {
+    let parsed = match style.to_lowercase().as_str() {
+        "columns" => VizStyle::Columns,
+        "rows" => VizStyle::Rows,
+        "bloom" => VizStyle::Bloom,
+        other => return Err(format!("Unknown viz style: {}", other)),
+    };
+    {
+        let mut cfg = state.inner().engine.config.lock().unwrap();
+        cfg.viz_style = parsed;
+    }
     Ok(())
 }
 
@@ -470,7 +626,9 @@ pub fn run() {
     let audio = Arc::new(AudioVisualizer::new());
     let engine = Arc::new(RgbEngine::new());
     load_persistent_config(&engine, &audio);
-    engine.start(Arc::clone(&audio));
+
+    let engine_for_setup = Arc::clone(&engine);
+    let audio_for_setup = Arc::clone(&audio);
 
     tauri::Builder::default()
         .manage(AppState {
@@ -483,6 +641,14 @@ pub fn run() {
             set_brightness,
             set_static_color,
             set_led_count,
+            set_debug_pattern,
+            set_debug_index,
+            set_debug_paused,
+            set_lane_layout,
+            set_viz_style,
+            set_marquee_text,
+            set_marquee_speed,
+            set_game_speed,
             set_audio_sensitivity,
             launch_openrgb_server,
             stop_armoury_crate_lighting,
@@ -491,7 +657,11 @@ pub fn run() {
             restart_app,
             quit_app
         ])
-        .setup(|app| {
+        .setup(move |app| {
+            // Started here so the engine can emit UI events via the app handle.
+            // Audio capture itself is lazy - the engine enables it only while a
+            // mode that reacts to audio is active.
+            engine_for_setup.start(Arc::clone(&audio_for_setup), app.handle().clone());
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
